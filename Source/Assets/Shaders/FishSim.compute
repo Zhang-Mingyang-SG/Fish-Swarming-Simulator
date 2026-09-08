@@ -1,0 +1,475 @@
+// GPU fish simulation.
+//   M1: seed + drift (Init, StepSorted's motion).
+//   M2: spatial grid — fixed 2^20 hash table + counting sort via a 2-level group-shared prefix
+//       sum. Neighbours are validated by colouring fish by local density (no flocking yet; M3
+//       replaces the density debug with real steering).
+//
+// The hash table is volume-independent: cell coords hash into a fixed table, and the per-neighbour
+// distance test makes hash collisions correctness-safe (a colliding far fish is simply distance-
+// rejected; a true neighbour is never missed because its cell always hashes to the bucket we scan).
+#pragma kernel Init
+#pragma kernel ClearCounts
+#pragma kernel Count
+#pragma kernel ScanBlocks
+#pragma kernel ScanBlockSums
+#pragma kernel AddBlockOffsets
+#pragma kernel InitCursor
+#pragma kernel Scatter
+#pragma kernel StepSorted
+#pragma kernel ReducePositions
+#pragma kernel SamplePositions
+
+#define TABLE_SIZE 1048576u   // 2^20 buckets
+#define TABLE_MASK 1048575u   // TABLE_SIZE - 1
+#define BLOCK 1024u           // scan block width; TABLE_SIZE / BLOCK = 1024 blocks (fits one scan group)
+
+struct FishInstance
+{
+    float4 pos;
+    float4 fwd; // xyz = heading, w = state/colour index
+};
+
+// Ping-ponged in C#: A = current, Sorted = cell-ordered this frame (becomes A next frame).
+RWStructuredBuffer<float4> _Positions;
+RWStructuredBuffer<float4> _Velocities;
+RWStructuredBuffer<float4> _SortedPos;   // xyz = position, w = state index (packed to save a UAV)
+RWStructuredBuffer<float4> _SortedVel;
+RWStructuredBuffer<float4> _Accel;       // carried acceleration (LOD), ping-ponged with _SortedAccel
+RWStructuredBuffer<float4> _SortedAccel;
+RWStructuredBuffer<FishInstance> _Instances;
+StructuredBuffer<float4>   _Predators;   // predator positions (xyz), uploaded from CPU
+StructuredBuffer<float4>   _Nodes;       // foraging node positions (xyz), uploaded from CPU
+RWStructuredBuffer<float4> _Partials;    // per-group position sums for the centroid reduction
+RWStructuredBuffer<float4> _Samples;     // strided spatial sample of fish positions (read back for predator cluster targeting)
+
+// Grid.
+RWStructuredBuffer<uint> _CellCounts;   // per bucket (kept for query ranges)
+RWStructuredBuffer<uint> _CellStart;    // per bucket, exclusive prefix sum
+RWStructuredBuffer<uint> _CellCursor;   // per bucket, scatter write cursor
+RWStructuredBuffer<uint> _BlockSums;    // per scan block
+RWStructuredBuffer<uint> _BlockOffsets; // per scan block
+
+uint  _Count;
+float _Dt;
+float3 _BoundsMin;
+float3 _BoundsMax;
+float _MinSpeed;
+float _MaxSpeed;
+float _SpawnRadius;
+uint  _Seed;
+float3 _GridOrigin;
+float _CellSize;
+float _PerceptionSqr;
+uint  _NumBlocks;
+uint  _SampleCount;
+uint  _SampleStride;
+
+// Steering (M3).
+float _SeparationRadiusSqr;
+float _SeparationWeight, _AlignmentWeight, _CohesionWeight, _BoundaryWeight;
+float3 _CohesionAxisWeights;
+float _MaxSteerForce;
+uint  _MaxNeighbors;
+float _SeparationGain, _MaxSeparationForce;
+float _RearBlindDot;
+float _BoundaryMargin;
+
+// Predator threat + FSM (M4).
+uint  _PredatorCount;
+float _PredatorFleeRadius, _ThreatWeight;
+float _RegroupNeighborDistance;
+float3 _SchoolingSAC, _FleeingSAC, _RegroupingSAC, _ForagingSAC;
+
+// Foraging (M4b): unthreatened fish near a seabed node may break off to peck at it.
+uint  _NodeCount;
+float _ForagingNodeRadiusSqr, _ForagingChancePerFrame, _ForagingDuration, _ForagingWeight;
+
+// Simulation LOD (M5). Far fish reuse carried acceleration on off-phase frames.
+uint  _LodEnabled;
+float3 _CameraPos;
+float _LodNearSqr, _LodMidSqr, _LodPredatorRadiusSqr;
+uint  _LodMidStride, _LodFarStride, _Frame;
+
+float hash11(uint n)
+{
+    n = (n ^ 61u) ^ (n >> 16); n *= 9u; n = n ^ (n >> 4); n *= 0x27d4eb2du; n = n ^ (n >> 15);
+    return frac(float(n) * (1.0 / 4294967296.0));
+}
+float3 rand3(uint i) { return float3(hash11(i*3u+_Seed), hash11(i*3u+1u+_Seed), hash11(i*3u+2u+_Seed)); }
+
+int3 CellCoord(float3 p) { return (int3)floor((p - _GridOrigin) / _CellSize); }
+
+uint HashCell(int3 c)
+{
+    uint h = (uint)(c.x) * 73856093u ^ (uint)(c.y) * 19349663u ^ (uint)(c.z) * 83492791u;
+    return h & TABLE_MASK;
+}
+
+// ---- Seeding -------------------------------------------------------------------------------
+
+[numthreads(256, 1, 1)]
+void Init(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _Count) return;
+    float3 centre = (_BoundsMin + _BoundsMax) * 0.5;
+    float3 pos = clamp(centre + (rand3(i) * 2.0 - 1.0) * _SpawnRadius, _BoundsMin, _BoundsMax);
+    float3 dir = rand3(i + _Count) * 2.0 - 1.0;
+    dir /= max(length(dir), 1e-4);
+    _Positions[i]  = float4(pos, 0); // w = state 0 (Schooling)
+    _Velocities[i] = float4(dir * (_MinSpeed + _MaxSpeed) * 0.5, 0);
+    _Accel[i] = float4(0, 0, 0, 0);
+}
+
+// ---- Grid build ----------------------------------------------------------------------------
+
+[numthreads(256, 1, 1)]
+void ClearCounts(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c < TABLE_SIZE) _CellCounts[c] = 0u;
+}
+
+[numthreads(256, 1, 1)]
+void Count(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _Count) return;
+    uint b = HashCell(CellCoord(_Positions[i].xyz));
+    InterlockedAdd(_CellCounts[b], 1u);
+}
+
+groupshared uint gScan[BLOCK];
+
+// Exclusive prefix sum within each BLOCK-sized chunk of _CellCounts -> _CellStart, plus each block's
+// total -> _BlockSums. (Inclusive Hillis-Steele in shared memory, then subtract own value.)
+[numthreads(BLOCK, 1, 1)]
+void ScanBlocks(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint3 dtid : SV_DispatchThreadID)
+{
+    uint g = tid.x;
+    uint idx = dtid.x;
+    uint val = (idx < TABLE_SIZE) ? _CellCounts[idx] : 0u;
+    gScan[g] = val;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint offset = 1u; offset < BLOCK; offset <<= 1u)
+    {
+        uint add = (g >= offset) ? gScan[g - offset] : 0u;
+        GroupMemoryBarrierWithGroupSync();
+        gScan[g] += add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (idx < TABLE_SIZE) _CellStart[idx] = gScan[g] - val; // exclusive, block-local
+    if (g == BLOCK - 1u) _BlockSums[gid.x] = gScan[g];      // block total
+}
+
+// Exclusive scan of the (<= BLOCK) block sums -> _BlockOffsets. Single group.
+[numthreads(BLOCK, 1, 1)]
+void ScanBlockSums(uint3 tid : SV_GroupThreadID)
+{
+    uint g = tid.x;
+    uint val = (g < _NumBlocks) ? _BlockSums[g] : 0u;
+    gScan[g] = val;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint offset = 1u; offset < BLOCK; offset <<= 1u)
+    {
+        uint add = (g >= offset) ? gScan[g - offset] : 0u;
+        GroupMemoryBarrierWithGroupSync();
+        gScan[g] += add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (g < _NumBlocks) _BlockOffsets[g] = gScan[g] - val; // exclusive
+}
+
+[numthreads(256, 1, 1)]
+void AddBlockOffsets(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c >= TABLE_SIZE) return;
+    _CellStart[c] += _BlockOffsets[c >> 10]; // c / BLOCK
+}
+
+[numthreads(256, 1, 1)]
+void InitCursor(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if (c < TABLE_SIZE) _CellCursor[c] = _CellStart[c];
+}
+
+[numthreads(256, 1, 1)]
+void Scatter(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _Count) return;
+    uint b = HashCell(CellCoord(_Positions[i].xyz));
+    uint slot;
+    InterlockedAdd(_CellCursor[b], 1u, slot);
+    _SortedPos[slot] = _Positions[i]; // carries state in .w automatically
+    _SortedVel[slot] = _Velocities[i];
+    _SortedAccel[slot] = _Accel[i];   // so LOD-skipped fish reuse their own carried acceleration
+}
+
+// ---- Steering (port of FishSteering; runs on the cell-sorted buffers) -----------------------
+
+float3 ClampMag(float3 v, float m)
+{
+    float l2 = dot(v, v);
+    return (l2 > m * m) ? v * (m / sqrt(l2)) : v;
+}
+
+// Reynolds steer: full-speed desired toward dir, minus current velocity, clamped.
+float3 Steer(float3 dir, float3 vel)
+{
+    if (dot(dir, dir) < 1e-8) return float3(0, 0, 0);
+    return ClampMag(normalize(dir) * _MaxSpeed - vel, _MaxSteerForce);
+}
+
+float3 Boundary(float3 pos, float3 vel)
+{
+    float m = _BoundaryMargin;
+    float3 inward = float3(0, 0, 0);
+    if (pos.x < _BoundsMin.x + m) inward.x += 1; else if (pos.x > _BoundsMax.x - m) inward.x -= 1;
+    if (pos.y < _BoundsMin.y + m) inward.y += 1; else if (pos.y > _BoundsMax.y - m) inward.y -= 1;
+    if (pos.z < _BoundsMin.z + m) inward.z += 1; else if (pos.z > _BoundsMax.z - m) inward.z -= 1;
+    if (dot(inward, inward) < 1e-8) return float3(0, 0, 0);
+    return Steer(inward, vel) * _BoundaryWeight;
+}
+
+// Accumulate one bucket's fish into the boid sums. Sets done=true once the neighbour cap is hit.
+void ScanBucket(uint b, uint self, float3 pos, float3 forward,
+    inout float3 sep, inout float3 aliSum, inout float3 cohSum, inout uint flock,
+    inout float nearestSqr, inout bool done)
+{
+    uint start = _CellStart[b];
+    uint end = start + _CellCounts[b];
+    for (uint k = start; k < end; k++)
+    {
+        if (done) break;
+        if (k == self) continue;
+        float3 off = pos - _SortedPos[k].xyz;
+        float d2 = dot(off, off);
+        if (d2 < _PerceptionSqr && d2 > 1e-6)
+        {
+            if (d2 < _SeparationRadiusSqr) sep += off / d2;               // omnidirectional
+            if (_RearBlindDot > -1.0 && dot(normalize(-off), forward) < _RearBlindDot) continue; // behind: no social
+            if (d2 < nearestSqr) nearestSqr = d2;
+            aliSum += _SortedVel[k].xyz;
+            cohSum += _SortedPos[k].xyz;
+            flock++;
+            if (flock >= _MaxNeighbors) done = true;
+        }
+    }
+}
+
+float3 SacFor(uint state)
+{
+    if (state == 1u) return _FleeingSAC;
+    if (state == 2u) return _RegroupingSAC;
+    if (state == 3u) return _ForagingSAC;
+    return _SchoolingSAC; // Schooling (0) / default
+}
+
+// Nearest foraging node within range; -1 if none. Used for both the pull force and the FSM's
+// "am I near food?" test.
+int NearestNode(float3 pos)
+{
+    int best = -1;
+    float bestSqr = _ForagingNodeRadiusSqr;
+    for (uint n = 0; n < _NodeCount; n++)
+    {
+        float3 off = _Nodes[n].xyz - pos;
+        float d2 = dot(off, off);
+        if (d2 < bestSqr) { bestSqr = d2; best = (int)n; }
+    }
+    return best;
+}
+
+// Strong repulsion from nearby predators; reports whether any predator is in flee range.
+float3 Threat(float3 pos, float3 vel, out bool inRange)
+{
+    inRange = false;
+    float3 flee = float3(0, 0, 0);
+    float r = _PredatorFleeRadius;
+    float r2 = r * r;
+    for (uint p = 0; p < _PredatorCount; p++)
+    {
+        float3 off = pos - _Predators[p].xyz;
+        float d2 = dot(off, off);
+        if (d2 < r2 && d2 > 1e-6)
+        {
+            inRange = true;
+            float d = sqrt(d2);
+            flee += (off / d) * (1.0 - d / r);
+        }
+    }
+    if (dot(flee, flee) < 1e-8) return float3(0, 0, 0);
+    return Steer(flee, vel) * _ThreatWeight;
+}
+
+// Frames between full neighbour scans for this fish. 1 = every frame. Predator proximity always
+// forces full rate so flee/split stays exact; otherwise it's distance to the camera.
+uint LodStride(float3 pos)
+{
+    for (uint p = 0; p < _PredatorCount; p++)
+    {
+        float3 d = pos - _Predators[p].xyz;
+        if (dot(d, d) < _LodPredatorRadiusSqr) return 1u;
+    }
+    float3 dc = pos - _CameraPos;
+    float camSqr = dot(dc, dc);
+    if (camSqr < _LodNearSqr) return 1u;
+    if (camSqr < _LodMidSqr) return _LodMidStride;
+    return _LodFarStride;
+}
+
+[numthreads(256, 1, 1)]
+void StepSorted(uint3 id : SV_DispatchThreadID)
+{
+    uint s = id.x;
+    if (s >= _Count) return;
+
+    float3 pos = _SortedPos[s].xyz;
+    float3 vel = _SortedVel[s].xyz;
+    uint state = (uint)_SortedPos[s].w; // state packed in position.w
+    float timer = _SortedVel[s].w;      // foraging duration timer packed in velocity.w
+    float3 forward = (dot(vel, vel) > 1e-8) ? normalize(vel) : float3(0, 0, 1);
+    int3 cc = CellCoord(pos);
+
+    // LOD: distant, off-phase fish skip the neighbour scan + FSM and reuse carried acceleration.
+    bool doFull = true;
+    if (_LodEnabled != 0u)
+    {
+        uint stride = LodStride(pos);
+        if (stride > 1u && ((_Frame + HashCell(cc)) % stride) != 0u) doFull = false;
+    }
+
+    float3 force;
+    if (doFull)
+    {
+        float3 sep = 0, aliSum = 0, cohSum = 0;
+        uint flock = 0;
+        float nearestSqr = 3.4e38;
+        bool done = false;
+
+        ScanBucket(HashCell(cc), s, pos, forward, sep, aliSum, cohSum, flock, nearestSqr, done); // own cell first
+        for (int dz = -1; dz <= 1 && !done; dz++)
+        for (int dy = -1; dy <= 1 && !done; dy++)
+        for (int dx = -1; dx <= 1 && !done; dx++)
+        {
+            if ((dx | dy | dz) == 0) continue;
+            ScanBucket(HashCell(cc + int3(dx, dy, dz)), s, pos, forward, sep, aliSum, cohSum, flock, nearestSqr, done);
+        }
+
+        float3 sac = SacFor(state);
+        force = 0;
+        if (flock > 0)
+        {
+            force += Steer(aliSum / (float)flock, vel) * (_AlignmentWeight * sac.y);
+            float3 coh = Steer(cohSum / (float)flock - pos, vel) * _CohesionAxisWeights;
+            force += coh * (_CohesionWeight * sac.z);
+        }
+        if (dot(sep, sep) > 1e-8)
+            force += ClampMag(sep * _SeparationGain, _MaxSeparationForce) * (_SeparationWeight * sac.x);
+        force += Boundary(pos, vel);
+
+        bool predatorInRange;
+        force += Threat(pos, vel, predatorInRange);
+
+        // Foraging pull toward the nearest node (uses the incoming state, like the CPU steering pass,
+        // so a fish that transitions to Foraging this frame starts pulling next frame).
+        int node = NearestNode(pos);
+        if (state == 3u && node >= 0)
+            force += Steer(_Nodes[node].xyz - pos, vel) * _ForagingWeight;
+
+        // FSM (port of FiniteStateMachine.Tick; predator pressure always wins). This pass runs every
+        // full frame, so the foraging timer accrues _Dt (not a staggered tick dt) and the trigger
+        // uses a per-frame chance (foragingChancePerTick / behaviorTickBuckets, set on the CPU).
+        uint newState;
+        float newTimer = timer;
+        if (predatorInRange)
+        {
+            newState = 1u;                       // -> Fleeing
+        }
+        else if (state == 1u)
+        {
+            newState = 2u;                       // Fleeing -> Regrouping
+        }
+        else if (state == 2u)
+        {
+            newState = (sqrt(nearestSqr) < _RegroupNeighborDistance) ? 0u : 2u; // Regrouping -> Schooling
+        }
+        else if (state == 3u)
+        {
+            newTimer = timer + _Dt;              // Foraging: leave on timeout or if the node is gone
+            newState = (newTimer > _ForagingDuration || node < 0) ? 0u : 3u;
+        }
+        else
+        {
+            // Schooling: near food + a passed roll breaks the fish off to forage.
+            float roll = hash11(s * 2654435761u + (uint)_Frame * 40503u + _Seed + 1u);
+            newState = (node >= 0 && roll < _ForagingChancePerFrame) ? 3u : 0u;
+        }
+        if (newState != state) newTimer = 0.0; // reset the timer on any state change
+
+        state = newState;
+        timer = newTimer;
+        _SortedAccel[s] = float4(force, 0); // remember for future skipped frames
+    }
+    else
+    {
+        force = _SortedAccel[s].xyz; // reuse carried; state + accel left untouched
+    }
+
+    // Integrate (every frame, so motion stays smooth even for skipped fish).
+    vel += force * _Dt;
+    float sp = length(vel);
+    vel = (sp < 1e-5) ? forward * _MinSpeed : vel / sp * clamp(sp, _MinSpeed, _MaxSpeed);
+    pos += vel * _Dt;
+
+    _SortedPos[s] = float4(pos, (float)state); // keep state packed in .w for next frame
+    _SortedVel[s] = float4(vel, timer);        // keep the foraging timer packed in .w
+
+    float3 f = (length(vel) > 1e-5) ? normalize(vel) : float3(0, 0, 1);
+    FishInstance inst;
+    inst.pos = float4(pos, 0);
+    inst.fwd = float4(f, (float)state);
+    _Instances[s] = inst;
+}
+
+// ---- School centroid reduction (per-group partial sums; CPU finishes via AsyncGPUReadback) --
+
+groupshared float3 gSum[256];
+
+[numthreads(256, 1, 1)]
+void ReducePositions(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint3 dtid : SV_DispatchThreadID)
+{
+    uint i = dtid.x;
+    uint t = tid.x;
+    gSum[t] = (i < _Count) ? _SortedPos[i].xyz : float3(0, 0, 0);
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u)
+    {
+        if (t < stride) gSum[t] += gSum[t + stride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (t == 0u) _Partials[gid.x] = float4(gSum[0], 0);
+}
+
+// ---- Spatial sample (strided over the cell-sorted buffer, so samples spread across the volume) --
+// A small fixed-size sample of fish positions read back to the CPU each frame. The predator uses it
+// to aim at the nearest sub-group's centroid instead of the whole-school mean (which sits in the
+// empty gap when the school splits). Sampling the cell-sorted buffer with a stride gives spatially
+// scattered points that still land inside real sub-groups.
+[numthreads(256, 1, 1)]
+void SamplePositions(uint3 id : SV_DispatchThreadID)
+{
+    uint k = id.x;
+    if (k >= _SampleCount) return;
+    uint idx = min(k * _SampleStride, _Count - 1u);
+    _Samples[k] = _SortedPos[idx];
+}

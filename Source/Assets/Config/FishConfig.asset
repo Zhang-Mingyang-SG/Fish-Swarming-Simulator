@@ -1,0 +1,47 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 3a7c1e9b45d24f08a1b6c9d0e2f30023, type: 3}
+  m_Name: FishConfig
+  m_EditorClassIdentifier: 
+  perceptionRadius: 6
+  separationRadius: 2
+  rearBlindAngle: 90
+  spawnRadius: 50
+  separationWeight: 1.6
+  alignmentWeight: 1
+  cohesionWeight: 1
+  boundaryWeight: 2
+  lodNearDistance: 60
+  lodMidDistance: 150
+  lodMidStride: 2
+  lodFarStride: 4
+  lodPredatorRadius: 32
+  separationGain: 4
+  maxSeparationForce: 40
+  cohesionAxisWeights: {x: 1, y: 0.7, z: 0.75}
+  maxSpeed: 8
+  minSpeed: 2
+  maxSteerForce: 8
+  boundaryMargin: 5
+  maxNeighbors: 32
+  predatorFleeRadius: 16
+  threatWeight: 5
+  regroupNeighborDistance: 4
+  foragingNodeRadius: 50
+  foragingChancePerTick: 0.02
+  foragingDuration: 4
+  foragingWeight: 1.5
+  behaviorTickBuckets: 20
+  schoolingSAC: {x: 1, y: 1, z: 1}
+  fleeingSAC: {x: 1.5, y: 0.5, z: 0.2}
+  regroupingSAC: {x: 1, y: 1.2, z: 2}
+  foragingSAC: {x: 1, y: 0.5, z: 0.3}
