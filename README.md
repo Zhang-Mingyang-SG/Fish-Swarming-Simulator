@@ -17,54 +17,58 @@ Double click the Fish Swarming Simulator.exe executable to open the simulation.
 
 ## 2. The Benchmark / Profiler Window
 
-The Benchmark window (titled *"Benchmark [C to toggle Config Menu]"*) is the profiler, used to
-monitor the simulation's performance metrics and shows you which optimisations are currently being 
-used at a glance. From top to bottom:
+The Benchmark window (titled *"Benchmark [C to toggle Config Menu]"*) is the profiler, used to monitor the simulation's performance metrics and shows you which optimisations are currently being used at a glance.
 
-**boid**:     Current population of boids.
-**Burst**:    Display for CPU Burst Setting. 
-              `ON`  = Burst-compiled parallel jobs.
-              `OFF` = plain single-threaded C#. 
-**Mode**:     Display for method used for neighbour-search/checks. 
-              `Uniform Grid` = Uses dense uniform spatial grid.
-              `Naive O(n^2)` = no optimisations, every boid check against every other boid up to perception radius.
-**Render**:   Display for method used for rendering. 
-              `Instanced`     = CPU builds matrices, uses `RenderMeshInstanced`. 
-              `GPU Indirect`  = Transforms built in the vertex shader, uses `RenderMeshIndirect`.
-**Sim LOD**:  Display for whether distant boids update less often. 
-              `ON` = Boids further away update less often
-              `OFF`= All boids update every frame
-              *Note: Boids close to enemy will update every frame regardless of this setting.
-**Backend**:  Display for where and how work is done on the backend. 
-              `CPU 1-thread`  = single-threaded managed C#, Burst off. 
-              `CPU Burst`     = multi-core, Burst-compiled + SIMD.
-              `GPU Compute`   = all per-boid work on the GPU.
-              *Note: `GPU Compute` forces use of hash grid, different from spatial grid indicated by **Mode**.
+From top to bottom:
 
-----------
+- **boid** — Current population of boids.
+- **Burst** — Display for CPU Burst Setting.
+  - `ON` = Burst-compiled parallel jobs.
+  - `OFF` = plain single-threaded C#.
+- **Mode** — Display for method used for neighbour-search/checks.
+  - `Uniform Grid` = Uses dense uniform spatial grid.
+  - `Naive O(n^2)` = no optimisations, every boid checks against every other boid up to perception radius.
+- **Render** — Display for method used for rendering.
+  - `Instanced` = CPU builds matrices, uses `RenderMeshInstanced`.
+  - `GPU Indirect` = Transforms built in the vertex shader, uses `RenderMeshIndirect`.
+- **Sim LOD** — Display for whether distant boids update less often.
+  - `ON` = Boids further away update less often.
+  - `OFF` = All boids update every frame.
+  - *Note: Boids close to enemy will update every frame regardless of this setting.*
+- **Backend** — Display for where and how work is done on the backend.
+  - `CPU 1-thread` = single-threaded managed C#, Burst off.
+  - `CPU Burst` = multi-core, Burst-compiled + SIMD.
+  - `GPU Compute` = all per-boid work on the GPU.
+  - *Note: `GPU Compute` forces use of hash grid, different from the spatial grid indicated by **Mode**.*
 
-**Per-frame timing table**
-Three metrics, each shown as **now / avg / max** (milliseconds), the lower the better:
-**Frame ms**  : Total end-to-end frame time. 
-                16.67 ms = 60 fps
-                33.34 ms = 30 fps.
-**Sim CPU ms**: CPU time spent in the simulation step. 
-**Steer ms**  : Time spent on neighbour-query / steering portion of the CPU sim. 
+---
 
-**FPS**: The number of frames being simulation runs per second. Is shown as `now` and `avg`, derived from Frame ms.
-- `avg` in both table and FPS is calculated from last 120 frames
+### Per-frame timing table
 
-----------
+Three metrics, each shown as **now / avg / max** (milliseconds) — lower is better:
 
-**The Rolling Graph**
+| Metric | Meaning |
+|---|---|
+| **Frame ms** | Total end-to-end frame time. `16.67 ms` = 60 fps, `33.34 ms` = 30 fps. |
+| **Sim CPU ms** | CPU time spent in the simulation step. |
+| **Steer ms** | Time spent on the neighbour-query / steering portion of the CPU sim. |
+
+**FPS** — The number of frames the simulation runs per second. Shown as `now` and `avg`, derived from Frame ms.
+
+- `avg` in both the table and FPS is calculated from the last 120 frames.
+
+---
+
+### The Rolling Graph
+
 A rolling 120-frame history strip that shows:
 
-- **Bars**                  : indicate time taken for each frame, colour-coded: 
-                              `Green` < 16.67 ms (≥60 fps)
-                              `Yellow` 16.67–33.34 ms (30–60 fps)
-                              `Red` > 33.34 ms (<30 fps). 
-- **Cyan line**             : shows **Sim CPU ms**. 
-- **White horizontal line** : shows the 60 fps mark (16.67 ms). 
+- **Bars** — time taken for each frame, colour-coded:
+  - `Green` < 16.67 ms (≥60 fps)
+  - `Yellow` 16.67–33.34 ms (30–60 fps)
+  - `Red` > 33.34 ms (<30 fps)
+- **Cyan line** — shows **Sim CPU ms**.
+- **White horizontal line** — shows the 60 fps mark (16.67 ms).
 
 ---------------------------------------------------------------------------------------------------------------------------
 
@@ -91,13 +95,11 @@ stays on the instanced/CPU path.
 A draggable window with two tabs: **boid** and **Predators**. Edits apply on the **next frame** (the manager re-reads the 
 config every frame), and they work on a *runtime copy* so changes made are not permanent.
 
-### 4.1 boid
-**boid count**                      — five preset buttons: **100 / 1,000 / 10,000 / 100,000 / 1,000,000**. 
-                                      Clicking one **respawns** the whole school at that size (safe to do live).
-**Spawn**                           — `Spawn Radius`: how tightly the school is clustered when it spawns.
-**Simulation**                      — the same four toggles as the keyboard, as buttons: 
-                                      `Burst`, `Grid / Naive`,`LOD`, `Sim: GPU / CPU`.
-**Weights**                         — the core flocking balance (each 0–5, Threat 0–12):
+### 4.1 Boid
+- **boid count** — five preset buttons: **100 / 1,000 / 10,000 / 100,000 / 1,000,000**. Clicking one **respawns** the whole school at that size (safe to do live).
+- **Spawn** — `Spawn Radius`: how tightly the school is clustered when it spawns.
+- **Simulation** — the same four toggles as the keyboard, as buttons: `Burst`, `Grid / Naive`, `LOD`, `Sim: GPU / CPU`.
+- **Weights** — the core flocking balance (each 0–5, Threat 0–12):
 
 | Slider          | What it does                                                             |
 |-----------------|--------------------------------------------------------------------------|
