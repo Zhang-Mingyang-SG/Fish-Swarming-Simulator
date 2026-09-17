@@ -1,11 +1,11 @@
 # Fish Swarm Simulator
 
-CSD 3183
-By Group 9
-Cheng Ming Xian [c.mingxian@digipen.edu]
-Zhang Mingyang [mingyang.zhang@digipen.edu]
-Lee Jia Rui [l.jiarui@digipen.edu]
-Ng Juin Herng [juinherng.ng@digipen.edu]
+- CSD 3183
+- By Group 9
+- Cheng Ming Xian [c.mingxian@digipen.edu]
+- Zhang Mingyang [mingyang.zhang@digipen.edu]
+- Lee Jia Rui [l.jiarui@digipen.edu]
+- Ng Juin Herng [juinherng.ng@digipen.edu]
 
 ---------------------------------------------------------------------------------------------------------------------------
 
@@ -78,7 +78,7 @@ These flip live on the *same* running population, so you can watch the cost chan
 
 | Key     | Toggles          | Effect                                                                                     |
 |---------|------------------|--------------------------------------------------------------------------------------------|
-| **C**   | Config window    | Show/hide the Config menu (Section ## 4 below).                                            |
+| **C**   | Config window    | Show/hide the Config menu (Section 4 below).                                            |
 | **B**   | Burst            | Switch between Burst-compiled parallel jobs ↔ single-threaded C#. *(CPU backend only.)*    |
 | **Tab** | Neighbour search | Switch between **Spatial Grid** ↔ **Naive O(n²)**. *(CPU backend only.)*                   |
 | **G**   | Render mode      | Switch between GPU **Instanced** ↔ **GPU Indirect**.                                       |
